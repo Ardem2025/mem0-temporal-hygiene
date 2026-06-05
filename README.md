@@ -1,67 +1,85 @@
 # mem0-temporal-hygiene
 
-**Temporal context, CRUD tools, and automated deduplication for Mem0 OSS + Qdrant setups.**
+**Temporal context, Soft-Deletes ("Memory Git"), deterministic merges, and hash-based caching for Mem0 OSS + Qdrant setups.**
 
-> Mem0 OSS stores user facts as flat vectors in Qdrant. Over time, contradictory and duplicate facts accumulate — the system has no built-in mechanism to resolve conflicts or expire outdated information. This plugin and maintenance script solve that problem.
+> Mem0 OSS stores user facts as flat vectors in Qdrant. Over time, contradictory and duplicate facts accumulate — the system has no built-in mechanism to resolve conflicts, track version history, or prune outdated information. This plugin and maintenance hygiene script solve that problem by introducing **soft-deletes, time-decay aware filtering, deterministic deduplication merges, and cache optimizations**.
 
-## The Problem
+---
 
-When using [Mem0 OSS](https://github.com/mem0ai/mem0) with a local Qdrant vector database, semantic memory suffers from three fundamental issues:
+## Technical Features
 
-1. **Time-Blindness** — Vector similarity search returns facts sorted by cosine similarity, not by recency. A fact from May 15 and a contradicting fact from June 2 look "synchronous" to the model. The agent cannot tell which one is current.
+### 1. "Memory Git" (Soft-Deletes & Versioning)
+Instead of physically purging old memories (which causes irrecoverable loss of historically valuable facts or logs), we employ a **Soft-Delete** strategy:
+- Outdated memories are marked with metadata `status: superseded` and linked to the newer winner memory ID (`superseded_by: winner_id`).
+- Manually deleted memories are marked as `status: deleted`.
+- This ensures full auditability of the agent's knowledge evolution, functioning similarly to git version history.
 
-2. **Weak Conflict Resolution** — Mem0's `.add()` pipeline uses LLM-driven extraction with MD5 hash deduplication. This catches byte-for-byte duplicates but misses semantic contradictions (e.g., "use path A" vs. "path A was replaced by path B"). Both facts coexist permanently. The Mem0 team has [explicitly closed](https://github.com/mem0ai/mem0/issues/4896) this as "not planned" — their v3 architecture treats it as by-design behavior.
+### 2. Low-latency DB-level Filtering
+The standard `prefetch`, `mem0_profile`, and `mem0_search` operations fetch points using Qdrant's field search filters:
+```json
+{
+  "must_not": [
+    { "key": "status", "match": { "value": "superseded" } },
+    { "key": "status", "match": { "value": "deleted" } }
+  ]
+}
+```
+Filtering happens directly in Qdrant, preventing obsolete facts from cluttering the agent's LLM context window, while saving memory database resources.
 
-3. **No Agent-Side CRUD** — Standard Mem0 plugins expose only `search`, `profile`, and `remember` tools. When the agent discovers an outdated fact mid-conversation, it has no way to delete or update it without writing raw HTTP calls to Qdrant's REST API.
+### 3. Hybrid Merge (Deterministic + LLM-driven)
+- **Deterministic Merge (Cosine $\ge$ 0.95):** When vector similarity is extremely high, facts are considered identical. The script automatically soft-deletes the older items and retains the newest one, bypassing LLM API calls entirely.
+- **LLM-driven Cleanups (Cosine 0.82 - 0.94):** Outdated or slightly overlapping facts are bundled together and sent to the LLM to resolve semantic contradictions (newer timestamp wins) or merge details into a consolidated memory.
 
-### Real-World Examples
+### 4. Hash-based Cache
+During the weekly run, groups of similar facts are hashed based on their IDs, timestamps, and contents. If a cluster has not changed since the last execution, the script fetches the resolution from a local JSON cache, saving LLM tokens.
 
-- **Ghost folder loop**: An old fact containing a path with an invisible Zero-Width Joiner character gets retrieved on every project scan. The agent copies the corrupted path and recreates a phantom folder, even though a newer fact says "don't use ZWJ in paths."
-- **Stale recovery instructions**: When a service fails, the agent retrieves a month-old recovery fact ("ask the user to re-authenticate in the browser") instead of the current fix ("the real issue is AppArmor blocking the SOCKS proxy").
+### 5. Agent-Side CRUD Tools
+Standard Mem0 Hermes plugins lack direct modification APIs. This plugin registers two new tools:
+- `mem0_update(memory_id, content)` — updates a specific memory and re-embeds it.
+- `mem0_delete(memory_id)` — soft-deletes a memory by UUID.
 
-## The Solution
+---
 
-This repository provides two components:
+## How It Works
 
-### 1. Enhanced Mem0 OSS Plugin (`__init__.py`)
+### Temporal Context Flow
+```
+Before (standard mem0-oss):
+  prefetch → "- User prefers dark mode"
+              (no date, no ID, no way to know if this is current)
 
-A drop-in replacement for the standard `mem0-oss` Hermes Agent plugin that adds:
+After (this plugin):
+  prefetch → "- [2026-05-15] User prefers dark mode [ID: abc123]"
+  prefetch → "- [2026-06-01] User switched to light mode [ID: def456]"
+              (LLM sees dates, picks the June fact, can delete the May fact)
+```
 
-- **Temporal context in all outputs** — Every fact returned by `prefetch`, `mem0_profile`, and `mem0_search` now includes its creation date and UUID:
-  ```
-  - [2026-06-02] AppArmor blocks Chromium via SOCKS proxy, use --no-proxy-server [ID: 9da2f37a-...]
-  - [2026-05-15] To recover cookies, log into Chromium browser [ID: ab12cd34-...]
-  ```
-  The LLM can now see that the June fact supersedes the May fact.
+### Soft-Delete Execution (Memory Hygiene)
+```
+1. Fetch all vector points from Qdrant where status is not "superseded" or "deleted"
+2. Group points by cosine similarity (threshold ≥ 0.82)
+3. If similarity ≥ 0.95:
+   → Deterministically mark older points as "superseded"
+4. If similarity is between 0.82 and 0.94:
+   → Calculate cluster hash.
+   → If cached, apply saved decision.
+   → Else, call LLM to resolve compromises, updates, and soft-deletions.
+5. Apply metadata updates:
+   - For deleted items: {"status": "superseded", "superseded_by": "winner_id"}
+   - For updated/merged items: Keep active status and write consolidated text.
+```
 
-- **`mem0_update(memory_id, content)`** — Update an existing fact's text and re-embed it in Qdrant.
-- **`mem0_delete(memory_id)`** — Delete an outdated or incorrect fact by its UUID.
-
-### 2. Memory Hygiene Script (`memory-hygiene.py`)
-
-An automated maintenance script that:
-
-1. Fetches all vectors from the Qdrant collection
-2. Groups points by cosine similarity (threshold ≥ 0.82)
-3. For each group, sends the facts to an LLM with instructions to:
-   - Identify contradictions (newer date wins)
-   - Merge duplicates into a single consolidated fact
-   - Flag obsolete entries for deletion
-4. Applies updates and deletions via the Mem0 SDK
-
-Designed to run weekly as a cron job or systemd timer.
+---
 
 ## Installation
 
 ### Prerequisites
-
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) with the `mem0-oss` plugin
-- Qdrant running locally (default: `localhost:6333`)
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) or any compatible framework
+- Qdrant running locally or remotely (default port `6333`)
 - Mem0 OSS Python package (`pip install mem0ai`)
 - An OpenAI-compatible LLM endpoint (e.g., OmniRoute, vLLM, ollama)
 
 ### Plugin Installation
-
 ```bash
 # Back up your existing plugin
 cp -r ~/.hermes/plugins/mem0-oss ~/.hermes/plugins/mem0-oss.bak
@@ -69,37 +87,33 @@ cp -r ~/.hermes/plugins/mem0-oss ~/.hermes/plugins/mem0-oss.bak
 # Copy the enhanced plugin
 cp plugin/__init__.py ~/.hermes/plugins/mem0-oss/__init__.py
 
-# Restart your Hermes gateway to pick up the new tools
+# Restart your Hermes gateway
 systemctl restart hermes-gateway
 ```
 
 ### Hygiene Script Installation
-
 ```bash
 # Copy the script
 cp scripts/memory-hygiene.py ~/.hermes/scripts/memory-hygiene.py
 chmod +x ~/.hermes/scripts/memory-hygiene.py
 
-# Test it (dry run logs to stdout)
+# Test run
 python3 ~/.hermes/scripts/memory-hygiene.py
 ```
 
-### Scheduling (Optional)
+### Scheduling
+Configure a cron task on your machine. For Hermes agents, add a cronjob configuration or systemd timer.
 
-Add to your weekly maintenance cron or systemd timer:
-
-```bash
-# Example: run every Sunday at 2 AM
-echo "0 2 * * 0 root /usr/bin/python3 /root/.hermes/scripts/memory-hygiene.py >> /var/log/memory-hygiene.log 2>&1" \
-  > /etc/cron.d/memory-hygiene
+Example crontab entry (runs every Sunday at 2 AM):
+```cron
+0 2 * * 0 root /usr/bin/python3 /root/.hermes/scripts/memory-hygiene.py >> /var/log/memory-hygiene.log 2>&1
 ```
 
-Or integrate into an existing Hermes cron maintenance script.
+---
 
 ## Configuration
 
 The plugin reads its configuration from `~/.hermes/mem0_oss.json`:
-
 ```json
 {
   "llm_model": "your-model-name",
@@ -112,55 +126,17 @@ The plugin reads its configuration from `~/.hermes/mem0_oss.json`:
   "embedding_dims": 1024,
   "qdrant_host": "localhost",
   "qdrant_port": 6333,
-  "collection_name": "hermes_user",
-  "user_id": "your_user_id"
+  "collection_name": "hermes_default",
+  "user_id": "default"
 }
 ```
 
-## How It Works
-
-### Temporal Context Flow
-
-```
-Before (standard mem0-oss):
-  prefetch → "- User prefers dark mode"
-                (no date, no ID, no way to know if this is current)
-
-After (this plugin):
-  prefetch → "- [2026-05-15] User prefers dark mode [ID: abc123]"
-  prefetch → "- [2026-06-01] User switched to light mode [ID: def456]"
-                (LLM sees dates, picks the June fact, can delete the May fact)
-```
-
-### Hygiene Script Flow
-
-```
-1. Fetch all 90 vectors from Qdrant
-2. Compute pairwise cosine similarity
-3. Group vectors with similarity ≥ 0.82
-   → Found 8 groups of potentially conflicting facts
-
-4. For each group, LLM produces a decision:
-   {
-     "deletions": ["old-uuid-1", "old-uuid-2"],
-     "updates": [{"id": "keep-uuid", "text": "Consolidated fact text"}]
-   }
-
-5. Apply via Mem0 SDK: m.update() and m.delete()
-   → Result: 8 deletions, 6 updates (90 → 82 clean facts)
-```
+---
 
 ## Background & Related Work
-
-- **Mem0 Issues**: [#4896](https://github.com/mem0ai/mem0/issues/4896), [#4904](https://github.com/mem0ai/mem0/issues/4904) — Community reports of the same problem; closed as "not planned" by maintainers.
-- **Generative Agents** (Park et al., 2023): Introduced `recency × importance × relevance` scoring for memory retrieval — the theoretical foundation for temporal prioritization.
-- **MemoryBank** (Zhong et al., 2023): Ebbinghaus forgetting curve applied to LLM memory — memories decay over time unless reinforced by access.
-- **RecallM** (2023): Updatable long-term memory with belief updating when contradictory information arrives.
+- **Mem0 Issues**: [#4896](https://github.com/mem0ai/mem0/issues/4896) — Community reports regarding conflicting facts deduplication; closed as "not planned" by the maintainers.
+- **Generative Agents** (Park et al., 2023): Retrieval based on `recency × importance × relevance`.
+- **MemoryBank** (Zhong et al., 2023): Memory decay based on access frequency.
 
 ## License
-
 MIT
-
-## Contributing
-
-Issues and PRs welcome. This started as a self-hosted fix for a real production problem — if you're running Mem0 OSS with Qdrant at scale, your contributions will help the community.

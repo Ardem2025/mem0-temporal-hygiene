@@ -6,7 +6,7 @@ machine: embeddings computed locally (bge-m3), vectors in Qdrant, LLM for
 fact extraction via OmniRoute.
 
 Config loaded from $HERMES_HOME/mem0_oss.json (optional). Defaults suit
-a typical self-hosted setup: LLM on :20130, Qdrant on :6333, embedder via OpenAI-compatible API.
+Dmitry's setup: OmniRoute on :20130, Qdrant on :6333, bge-m3 embedder.
 """
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ def _default_config() -> dict:
         "embedding_dims": None,
         "qdrant_host": "localhost",
         "qdrant_port": 6333,
-        "collection_name": "hermes_memories",
-        "user_id": "default_user",
+        "collection_name": "hermes_dmitry",
+        "user_id": "dmitry",
     }
 
 
@@ -172,7 +172,7 @@ class Mem0OSSProvider(MemoryProvider):
         self._cfg: dict | None = None
         self._memory = None
         self._lock = threading.Lock()
-        self._user_id = "default_user"
+        self._user_id = "dmitry"
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
@@ -203,6 +203,15 @@ class Mem0OSSProvider(MemoryProvider):
             self._memory = Memory.from_config(_build_mem0_config(self._cfg))
             return self._memory
 
+    def _get_active_filters(self) -> dict:
+        return {
+            "user_id": self._user_id,
+            "NOT": [
+                {"status": "superseded"},
+                {"status": "deleted"}
+            ]
+        }
+
     def save_config(self, values, hermes_home):
         from pathlib import Path
         path = Path(hermes_home) / "mem0_oss.json"
@@ -217,9 +226,9 @@ class Mem0OSSProvider(MemoryProvider):
 
     def get_config_schema(self):
         return [
-            {"key": "user_id", "description": "User identifier", "default": "default_user"},
+            {"key": "user_id", "description": "User identifier", "default": "dmitry"},
             {"key": "llm_model", "description": "LLM via OmniRoute", "default": "hermes-nvidia-fast"},
-            {"key": "llm_base_url", "description": "LLM endpoint URL", "default": "http://localhost:20130/v1"},
+            {"key": "llm_base_url", "description": "OmniRoute URL", "default": "http://localhost:20130/v1"},
             {"key": "embedder_model", "description": "Local embedding model", "default": "BAAI/bge-m3"},
             {"key": "qdrant_host", "description": "Qdrant host", "default": "localhost"},
             {"key": "qdrant_port", "description": "Qdrant port", "default": 6333},
@@ -227,7 +236,7 @@ class Mem0OSSProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._cfg = _load_config()
-        self._user_id = kwargs.get("user_id") or self._cfg.get("user_id", "default_user")
+        self._user_id = kwargs.get("user_id") or self._cfg.get("user_id", "dmitry")
 
     def system_prompt_block(self) -> str:
         return (
@@ -252,7 +261,7 @@ class Mem0OSSProvider(MemoryProvider):
                 m = self._get_memory()
                 # Clip search query to prevent embedding token limit errors (e.g. 512 tokens for NVIDIA NIM)
                 clipped = query[:800] if query else ""
-                res = m.search(query=clipped, filters={"user_id": self._user_id}, limit=5)
+                res = m.search(query=clipped, filters=self._get_active_filters(), limit=5)
                 items = res.get("results", []) if isinstance(res, dict) else res
                 lines = []
                 for r in items:
@@ -306,7 +315,7 @@ class Mem0OSSProvider(MemoryProvider):
 
         if tool_name == "mem0_profile":
             try:
-                res = m.get_all(filters={"user_id": self._user_id})
+                res = m.get_all(filters=self._get_active_filters())
                 items = res.get("results", []) if isinstance(res, dict) else res
                 if not items:
                     return json.dumps({"result": "Память пуста."})
@@ -332,7 +341,7 @@ class Mem0OSSProvider(MemoryProvider):
             try:
                 # Clip search query to prevent embedding token limit errors (e.g. 512 tokens for NVIDIA NIM)
                 clipped = query[:800]
-                res = m.search(query=clipped, filters={"user_id": self._user_id}, limit=top_k)
+                res = m.search(query=clipped, filters=self._get_active_filters(), limit=top_k)
                 items = res.get("results", []) if isinstance(res, dict) else res
                 if not items:
                     return json.dumps({"result": "Релевантных фактов не найдено."}, ensure_ascii=False)
@@ -375,8 +384,14 @@ class Mem0OSSProvider(MemoryProvider):
             if not memory_id:
                 return tool_error("Нужен параметр memory_id")
             try:
-                m.delete(memory_id)
-                return json.dumps({"result": f"Факт {memory_id} успешно удалён из памяти."}, ensure_ascii=False)
+                # Get the existing memory text to preserve it during soft-delete update
+                mem_item = m.get(memory_id)
+                if not mem_item:
+                    return tool_error(f"Факт с ID {memory_id} не найден.")
+                content = mem_item.get("memory") or mem_item.get("text") or ""
+                # Perform soft-delete by setting status payload to "deleted"
+                m.update(memory_id, content, metadata={"status": "deleted", "user_id": self._user_id})
+                return json.dumps({"result": f"Факт {memory_id} успешно помечен как удалённый (soft-delete)."}, ensure_ascii=False)
             except Exception as e:
                 return tool_error(f"Не удалось удалить факт: {e}")
 

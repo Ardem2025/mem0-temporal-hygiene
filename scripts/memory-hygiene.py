@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Memory Hygiene and De-duplication script for Mem0 OSS + Qdrant.
+Memory Hygiene and De-duplication script for KUZHOMESRV.
 Walks through the Mem0 Qdrant collection, groups semantically similar facts,
 and uses LLM-driven consolidation to resolve contradictions and remove obsolete points.
 """
@@ -11,6 +11,7 @@ import sys
 import json
 import urllib.request
 import logging
+import hashlib
 from datetime import datetime, timezone
 import numpy as np
 import dotenv
@@ -21,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("memory-hygiene")
 
 # Load environment variables
-dotenv.load_dotenv(os.path.expanduser("~/.hermes/.env"))
+dotenv.load_dotenv("/root/.hermes/.env")
 
 # Ensure paths
 sys.path.insert(0, "/root/.hermes")
@@ -43,11 +44,11 @@ def load_mem0_config() -> dict:
         "embedding_dims": 1024,
         "qdrant_host": "localhost",
         "qdrant_port": 6333,
-        "collection_name": "hermes_memories",
-        "user_id": "default_user",
+        "collection_name": "hermes_dmitry",
+        "user_id": "139351986",
     }
     
-    path = os.path.expanduser("~/.hermes/mem0_oss.json")
+    path = "/root/.hermes/mem0_oss.json"
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -110,7 +111,23 @@ def fetch_qdrant_points(cfg: dict) -> list:
     payload = {
         "limit": 500,
         "with_payload": True,
-        "with_vector": True
+        "with_vector": True,
+        "filter": {
+            "must_not": [
+                {
+                    "key": "status",
+                    "match": {
+                        "value": "superseded"
+                    }
+                },
+                {
+                    "key": "status",
+                    "match": {
+                        "value": "deleted"
+                    }
+                }
+            ]
+        }
     }
     
     req = urllib.request.Request(
@@ -157,6 +174,62 @@ def group_points_by_similarity(points: list, threshold: float = 0.82) -> list:
             
     return groups
 
+def load_cache(cache_path: str) -> dict:
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning("Failed to load cache: %s", e)
+    return {}
+
+def save_cache(cache_path: str, cache: dict):
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Failed to save cache: %s", e)
+
+def get_group_hash(group: list) -> str:
+    sorted_points = sorted(group, key=lambda x: x["id"])
+    hasher = hashlib.sha256()
+    for p in sorted_points:
+        p_id = p["id"]
+        p_payload = p.get("payload", {})
+        p_data = p_payload.get("data") or p_payload.get("memory") or ""
+        created_at = p_payload.get("created_at") or ""
+        item_str = f"{p_id}:{created_at}:{p_data}"
+        hasher.update(item_str.encode('utf-8'))
+    return hasher.hexdigest()
+
+def check_deterministic_merge(group: list, threshold: float = 0.95) -> dict | None:
+    if len(group) < 2:
+        return None
+        
+    sorted_group = sorted(group, key=lambda x: x.get("payload", {}).get("created_at") or "")
+    newest = sorted_group[-1]
+    newest_vector = newest.get("vector", {}).get("")
+    if not newest_vector:
+        return None
+        
+    all_matching = True
+    for p in sorted_group[:-1]:
+        p_vector = p.get("vector", {}).get("")
+        if not p_vector:
+            all_matching = False
+            break
+        sim = cosine_similarity(newest_vector, p_vector)
+        if sim < threshold:
+            all_matching = False
+            break
+            
+    if all_matching:
+        deletions = [p["id"] for p in sorted_group[:-1]]
+        logger.info(f"  [DETERMINISTIC MERGE] Group of {len(group)} items is near-identical (cosine >= {threshold}). Keeping newest [{newest['id'][:8]}] and deleting others.")
+        return {"deletions": deletions, "updates": []}
+        
+    return None
+
 def analyze_group_with_llm(client: openai.OpenAI, model_name: str, group: list) -> dict:
     memories_str = []
     for p in group:
@@ -184,6 +257,14 @@ Your Goal:
 5. If an existing memory needs to be updated with consolidated clean text, output its ID and consolidated text in "updates".
 6. If the memories are actually about completely different things and should both be kept as they are, return empty updates and deletions.
 
+SPECIAL RULES:
+- CRITICAL: ANTIPHASE / CONFLICTING CONFIGURATIONS
+  Pay extremely close attention to negation or toggle words (e.g., "off", "on", "not", "no", "never", "inactive", "active", "не", "нет", "включить", "отключить", "загружать", "блокировать").
+  If the memories represent polar opposite states or different toggle options (e.g., "dark mode is on" vs "dark mode is off", "agent must ask before X" vs "agent must do X automatically", "Yandex cookies refresh using CDP" vs "cookies expired, auth manually"), do NOT merge them or mark either as deleted. Keep them both as separate, distinct facts of different circumstances.
+  
+- USER INTENT & VERIFIED SOURCE PRIORITY
+  Usually, newer facts override older ones. However, if an older fact represents a verified explicit user preference (e.g. "Dmitry prefers setting X") and a newer fact is a transient observation of a server error or a temporary state (e.g., "Script failed with error Y"), do NOT let the newer error state override the user's explicit preference. Explicit intent and preference MUST override transient observations.
+
 Format the output strictly as a JSON object, like this:
 {{
   "deletions": ["uuid-to-delete-1", "uuid-to-delete-2"],
@@ -208,7 +289,6 @@ No extra comments, no markdown code blocks, just raw JSON.
             temperature=0.1
         )
         content = res.choices[0].message.content.strip()
-        # Clean markdown wrapper if any
         if content.startswith("```"):
             lines = content.split("\n")
             if lines[0].startswith("```json") or lines[0].startswith("```"):
@@ -250,6 +330,10 @@ def main():
     groups = group_points_by_similarity(points, threshold=0.82)
     logger.info(f"Found {len(groups)} groups of potentially similar/duplicate memories.")
     
+    # Load cache
+    cache_path = "/root/.hermes/memory_hygiene_cache.json"
+    cache = load_cache(cache_path)
+    
     total_deletions = 0
     total_updates = 0
     
@@ -260,8 +344,25 @@ def main():
             p_data = p_payload.get("data") or p_payload.get("memory") or ""
             logger.info(f"  - [{p['id'][:8]}] {p_payload.get('created_at', '')[:10]}: {p_data[:80]}...")
             
-        decision = analyze_group_with_llm(client, model_name, group)
-        logger.info(f"  LLM Decision: {json.dumps(decision, ensure_ascii=False)}")
+        group_hash = get_group_hash(group)
+        
+        # Check rule-based deterministic merge first (similarity >= 0.95)
+        deterministic_decision = check_deterministic_merge(group, threshold=0.95)
+        
+        if deterministic_decision is not None:
+            decision = deterministic_decision
+            cache[group_hash] = decision
+            save_cache(cache_path, cache)
+        else:
+            if group_hash in cache:
+                logger.info(f"  [CACHE HIT] Cluster is unchanged since last hygiene run. Skipping LLM call and applying cached decision.")
+                decision = cache[group_hash]
+            else:
+                decision = analyze_group_with_llm(client, model_name, group)
+                cache[group_hash] = decision
+                save_cache(cache_path, cache)
+            
+        logger.info(f"  Decision: {json.dumps(decision, ensure_ascii=False)}")
         
         deletions = decision.get("deletions", [])
         updates = decision.get("updates", [])
@@ -278,14 +379,46 @@ def main():
                 except Exception as e:
                     logger.error(f"  Failed to update fact {up_id}: {e}")
                     
-        # Perform deletions via Mem0 SDK
+        # Perform soft-deletions via Mem0 SDK to retain historical record
+        user_id = cfg.get("user_id", "dmitry")
         for del_id in deletions:
             try:
-                m.delete(del_id)
-                logger.info(f"  [DELETED] Fact {del_id[:8]}")
+                del_text = None
+                for p in group:
+                    if p["id"] == del_id:
+                        p_payload = p.get("payload", {})
+                        del_text = p_payload.get("data") or p_payload.get("memory") or ""
+                        break
+                
+                if not del_text:
+                    try:
+                        mem_info = m.get(del_id)
+                        del_text = mem_info.get("memory") if mem_info else None
+                    except Exception:
+                        pass
+                
+                if not del_text:
+                    del_text = "[Superseded fact]"
+
+                winner_id = None
+                if updates:
+                    winner_id = updates[0].get("id")
+                else:
+                    remaining = [p["id"] for p in group if p["id"] not in deletions]
+                    if remaining:
+                        winner_id = remaining[0]
+
+                meta = {"status": "superseded", "user_id": user_id}
+                if winner_id:
+                    meta["superseded_by"] = winner_id
+                else:
+                    meta["status"] = "deleted"
+
+                m.update(del_id, del_text, metadata=meta)
+                logger.info(f"  [SOFT-DELETED] Fact {del_id[:8]} with metadata {meta}")
                 total_deletions += 1
             except Exception as e:
-                logger.error(f"  Failed to delete fact {del_id}: {e}")
+                logger.error(f"  Failed to soft-delete fact {del_id}: {e}")
                 
     logger.info(f"Hygiene job complete. Deletions check: deleted {total_deletions} points, updated {total_updates} points.")
 
