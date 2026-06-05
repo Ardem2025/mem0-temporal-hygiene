@@ -12,6 +12,8 @@ import json
 import urllib.request
 import logging
 import hashlib
+import re
+import argparse
 from datetime import datetime, timezone
 import numpy as np
 import dotenv
@@ -20,6 +22,30 @@ import openai
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("memory-hygiene")
+
+
+MEMORY_SCHEMA_VERSION = "2026-06-05-write-guard-v1"
+NEGATION_RE = re.compile(
+    r"\b(не|нет|никогда|запрет|запрещ|не надо|no|not|never|disable|disabled|off|without|avoid|don't|do not)\b",
+    re.IGNORECASE,
+)
+TOGGLE_RE = re.compile(
+    r"\b(enable|enabled|disable|disabled|on|off|turn on|turn off|включи|включать|выключи|выключать|активир|деактивир)\b",
+    re.IGNORECASE,
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def has_negation_or_toggle(text: str) -> bool:
+    return bool(NEGATION_RE.search(text or "") or TOGGLE_RE.search(text or ""))
+
+
+def point_text(point: dict) -> str:
+    payload = point.get("payload", {})
+    return payload.get("data") or payload.get("memory") or ""
 
 # Load environment variables
 dotenv.load_dotenv("/root/.hermes/.env")
@@ -205,13 +231,20 @@ def get_group_hash(group: list) -> str:
 def check_deterministic_merge(group: list, threshold: float = 0.95) -> dict | None:
     if len(group) < 2:
         return None
-        
+
+    # Guard against antiphrase/toggle false merges. Vector similarity can put
+    # "enable X" and "disable X" very close; leave those to the LLM path.
+    guarded = [p for p in group if has_negation_or_toggle(point_text(p))]
+    if guarded:
+        logger.info("  [DETERMINISTIC SKIP] Negation/toggle marker found; routing group to LLM analysis instead of auto-merge.")
+        return None
+
     sorted_group = sorted(group, key=lambda x: x.get("payload", {}).get("created_at") or "")
     newest = sorted_group[-1]
     newest_vector = newest.get("vector", {}).get("")
     if not newest_vector:
         return None
-        
+
     all_matching = True
     for p in sorted_group[:-1]:
         p_vector = p.get("vector", {}).get("")
@@ -222,12 +255,12 @@ def check_deterministic_merge(group: list, threshold: float = 0.95) -> dict | No
         if sim < threshold:
             all_matching = False
             break
-            
+
     if all_matching:
         deletions = [p["id"] for p in sorted_group[:-1]]
-        logger.info(f"  [DETERMINISTIC MERGE] Group of {len(group)} items is near-identical (cosine >= {threshold}). Keeping newest [{newest['id'][:8]}] and deleting others.")
-        return {"deletions": deletions, "updates": []}
-        
+        logger.info(f"  [DETERMINISTIC MERGE] Group of {len(group)} items is near-identical (cosine >= {threshold}) and passed negation guard. Keeping newest [{newest['id'][:8]}] and soft-deleting others.")
+        return {"deletions": deletions, "updates": [], "decision_source": "deterministic_similarity_guarded"}
+
     return None
 
 def analyze_group_with_llm(client: openai.OpenAI, model_name: str, group: list) -> dict:
@@ -298,8 +331,8 @@ No extra comments, no markdown code blocks, just raw JSON.
         logger.error("LLM group analysis failed: %s", e)
         return {"deletions": [], "updates": []}
 
-def main():
-    logger.info("Initializing Memory Hygiene Job...")
+def main(dry_run: bool = False):
+    logger.info("Initializing Memory Hygiene Job%s...", " (dry-run/report-only)" if dry_run else "")
     cfg = load_mem0_config()
     
     # Initialize Mem0 Memory SDK
@@ -351,16 +384,18 @@ def main():
         
         if deterministic_decision is not None:
             decision = deterministic_decision
-            cache[group_hash] = decision
-            save_cache(cache_path, cache)
+            if not dry_run:
+                cache[group_hash] = decision
+                save_cache(cache_path, cache)
         else:
             if group_hash in cache:
                 logger.info(f"  [CACHE HIT] Cluster is unchanged since last hygiene run. Skipping LLM call and applying cached decision.")
                 decision = cache[group_hash]
             else:
                 decision = analyze_group_with_llm(client, model_name, group)
-                cache[group_hash] = decision
-                save_cache(cache_path, cache)
+                if not dry_run:
+                    cache[group_hash] = decision
+                    save_cache(cache_path, cache)
             
         logger.info(f"  Decision: {json.dumps(decision, ensure_ascii=False)}")
         
@@ -373,8 +408,22 @@ def main():
             up_text = update_item.get("text")
             if up_id and up_text:
                 try:
-                    m.update(up_id, up_text)
-                    logger.info(f"  [UPDATED] Fact {up_id[:8]} -> '{up_text}'")
+                    meta = {
+                        "status": "active",
+                        "user_id": cfg.get("user_id", "dmitry"),
+                        "memory_schema_version": MEMORY_SCHEMA_VERSION,
+                        "source": "memory_hygiene",
+                        "provenance": "batch_hygiene_llm_or_rule",
+                        "confidence": 0.8,
+                        "source_confidence": 0.8,
+                        "updated_at_client": utc_now(),
+                        "hygiene_decision": "consolidated_update",
+                    }
+                    if dry_run:
+                        logger.info(f"  [DRY-RUN][UPDATE] Would update fact {up_id[:8]} -> '{up_text}' with metadata {meta}")
+                    else:
+                        m.update(up_id, up_text, metadata=meta)
+                        logger.info(f"  [UPDATED] Fact {up_id[:8]} -> '{up_text}' with metadata {meta}")
                     total_updates += 1
                 except Exception as e:
                     logger.error(f"  Failed to update fact {up_id}: {e}")
@@ -408,19 +457,48 @@ def main():
                     if remaining:
                         winner_id = remaining[0]
 
-                meta = {"status": "superseded", "user_id": user_id}
+                meta = {
+                    "status": "superseded",
+                    "user_id": user_id,
+                    "memory_schema_version": MEMORY_SCHEMA_VERSION,
+                    "source": "memory_hygiene",
+                    "provenance": "batch_hygiene_llm_or_rule",
+                    "confidence": 0.75,
+                    "source_confidence": 0.8,
+                    "updated_at_client": utc_now(),
+                    "superseded_at_client": utc_now(),
+                    "hygiene_decision": "soft_delete_superseded",
+                }
                 if winner_id:
                     meta["superseded_by"] = winner_id
                 else:
                     meta["status"] = "deleted"
+                    meta["deleted_at_client"] = utc_now()
 
-                m.update(del_id, del_text, metadata=meta)
-                logger.info(f"  [SOFT-DELETED] Fact {del_id[:8]} with metadata {meta}")
+                if dry_run:
+                    logger.info(f"  [DRY-RUN][SOFT-DELETE] Would mark fact {del_id[:8]} with metadata {meta}")
+                else:
+                    m.update(del_id, del_text, metadata=meta)
+                    logger.info(f"  [SOFT-DELETED] Fact {del_id[:8]} with metadata {meta}")
                 total_deletions += 1
             except Exception as e:
                 logger.error(f"  Failed to soft-delete fact {del_id}: {e}")
                 
-    logger.info(f"Hygiene job complete. Deletions check: deleted {total_deletions} points, updated {total_updates} points.")
+    action = "would soft-delete" if dry_run else "deleted"
+    update_action = "would update" if dry_run else "updated"
+    logger.info(f"Hygiene job complete. Deletions check: {action} {total_deletions} points, {update_action} {total_updates} points.")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Mem0/Qdrant memory hygiene with soft-delete metadata overlay.")
+    parser.add_argument("--dry-run", action="store_true", help="Report proposed updates/soft-deletes without writing to Mem0/Qdrant.")
+    parser.add_argument("--report-only", action="store_true", help="Alias for --dry-run; intended for safe scheduled audits.")
+    args = parser.parse_args()
+    if args.report_only:
+        args.dry_run = True
+    return args
+
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(dry_run=args.dry_run)

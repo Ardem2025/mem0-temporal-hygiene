@@ -10,10 +10,13 @@ Dmitry's setup: OmniRoute on :20130, Qdrant on :6333, bge-m3 embedder.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -58,6 +61,33 @@ def _clip_text(text: str, limit: int) -> str:
         return text[:limit] + "…"
     return text
 
+
+
+MEMORY_SCHEMA_VERSION = "2026-06-05-write-guard-v1"
+NEGATION_RE = re.compile(
+    r"\b(не|нет|никогда|запрет|запрещ|не надо|no|not|never|disable|disabled|off|without|avoid|don't|do not)\b",
+    re.IGNORECASE,
+)
+TOGGLE_RE = re.compile(
+    r"\b(enable|enabled|disable|disabled|on|off|turn on|turn off|включи|включать|выключи|выключать|активир|деактивир)\b",
+    re.IGNORECASE,
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _fingerprint(text: str) -> str:
+    return hashlib.sha256((text or "").strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+def _has_negation_or_toggle(text: str) -> bool:
+    return bool(NEGATION_RE.search(text or "") or TOGGLE_RE.search(text or ""))
+
+
+def _memory_text(item: dict) -> str:
+    return item.get("memory") or item.get("text") or item.get("data") or ""
 
 def _build_mem0_config(cfg: dict) -> dict:
     return {
@@ -210,6 +240,69 @@ class Mem0OSSProvider(MemoryProvider):
                 {"status": "superseded"},
                 {"status": "deleted"}
             ]
+        }
+
+    def _base_metadata(self, *, source: str = "explicit_tool", confidence: float = 0.85) -> dict:
+        now = _utc_now()
+        return {
+            "status": "active",
+            "user_id": self._user_id,
+            "memory_schema_version": MEMORY_SCHEMA_VERSION,
+            "source": source,
+            "provenance": source,
+            "confidence": confidence,
+            "source_confidence": confidence,
+            "created_at_client": now,
+            "updated_at_client": now,
+        }
+
+    def _search_write_candidates(self, m, content: str, *, top_k: int = 5) -> list[dict]:
+        try:
+            clipped = (content or "")[:800]
+            if not clipped.strip():
+                return []
+            res = m.search(query=clipped, filters=self._get_active_filters(), top_k=top_k)
+            items = res.get("results", []) if isinstance(res, dict) else res
+            return [r for r in items if _memory_text(r)]
+        except TypeError:
+            res = m.search(query=(content or "")[:800], filters=self._get_active_filters(), limit=top_k)
+            items = res.get("results", []) if isinstance(res, dict) else res
+            return [r for r in items if _memory_text(r)]
+        except Exception as e:
+            logger.debug("mem0 write-candidate search failed: %s", e)
+            return []
+
+    def _classify_write_relation(self, content: str, candidates: list[dict]) -> dict:
+        related = []
+        possible_duplicates = []
+        possible_conflicts = []
+        new_guarded = _has_negation_or_toggle(content)
+        for c in candidates:
+            cid = c.get("id") or c.get("memory_id") or ""
+            if not cid:
+                continue
+            score = float(c.get("score") or 0.0)
+            text = _memory_text(c)
+            if score >= 0.72:
+                related.append(cid)
+            if score >= 0.92 and not (new_guarded or _has_negation_or_toggle(text)):
+                possible_duplicates.append(cid)
+            if score >= 0.78 and (new_guarded or _has_negation_or_toggle(text)):
+                possible_conflicts.append(cid)
+
+        status = "none"
+        if possible_conflicts:
+            status = "suspected_conflict"
+        elif possible_duplicates:
+            status = "possible_duplicate"
+
+        return {
+            "conflict_status": status,
+            "conflicts_with": possible_conflicts[:5],
+            "possible_duplicate_of": possible_duplicates[:5],
+            "related_memory_ids": related[:5],
+            "write_guard": "detect_append_no_delete",
+            "candidate_count": len(candidates),
         }
 
     def save_config(self, values, hermes_home):
@@ -369,12 +462,31 @@ class Mem0OSSProvider(MemoryProvider):
                 return tool_error("Нужен параметр content")
             try:
                 limit = int((self._cfg or {}).get("remember_char_limit", 900))
-                res = m.add(_clip_text(content, limit), user_id=self._user_id)
+                clipped_content = _clip_text(content, limit)
+                candidates = self._search_write_candidates(m, clipped_content)
+                relation = self._classify_write_relation(clipped_content, candidates)
+                metadata = self._base_metadata(source="explicit_mem0_remember", confidence=0.85)
+                metadata.update(relation)
+                metadata["content_fingerprint"] = _fingerprint(clipped_content)
+
+                # Conservative write path: detect and annotate conflicts/duplicates, but let Mem0
+                # keep its normal extraction UX. We do not soft-delete or supersede anything here.
+                res = m.add(
+                    clipped_content,
+                    user_id=self._user_id,
+                    metadata=metadata,
+                    infer=bool((self._cfg or {}).get("remember_infer", True)),
+                )
                 items = res.get("results", []) if isinstance(res, dict) else res
                 added = [r for r in items if r.get("event") == "ADD"]
                 return json.dumps({
                     "result": f"Сохранено {len(added)} факт(ов).",
                     "facts": [r.get("memory", "") for r in added],
+                    "write_guard": {
+                        "conflict_status": relation["conflict_status"],
+                        "conflicts_with": relation["conflicts_with"],
+                        "possible_duplicate_of": relation["possible_duplicate_of"],
+                    },
                 }, ensure_ascii=False)
             except Exception as e:
                 return tool_error(f"Сохранение не удалось: {e}")
@@ -389,8 +501,10 @@ class Mem0OSSProvider(MemoryProvider):
                 if not mem_item:
                     return tool_error(f"Факт с ID {memory_id} не найден.")
                 content = mem_item.get("memory") or mem_item.get("text") or ""
-                # Perform soft-delete by setting status payload to "deleted"
-                m.update(memory_id, content, metadata={"status": "deleted", "user_id": self._user_id})
+                # Perform soft-delete by setting status payload to "deleted" while keeping provenance.
+                metadata = self._base_metadata(source="explicit_mem0_delete", confidence=1.0)
+                metadata.update({"status": "deleted", "deleted_at_client": _utc_now()})
+                m.update(memory_id, content, metadata=metadata)
                 return json.dumps({"result": f"Факт {memory_id} успешно помечен как удалённый (soft-delete)."}, ensure_ascii=False)
             except Exception as e:
                 return tool_error(f"Не удалось удалить факт: {e}")
@@ -401,8 +515,21 @@ class Mem0OSSProvider(MemoryProvider):
             if not memory_id or not content:
                 return tool_error("Нужны параметры memory_id и content")
             try:
-                m.update(memory_id, content)
-                return json.dumps({"result": f"Факт {memory_id} успешно обновлён."}, ensure_ascii=False)
+                candidates = [c for c in self._search_write_candidates(m, content) if (c.get("id") or c.get("memory_id")) != memory_id]
+                relation = self._classify_write_relation(content, candidates)
+                metadata = self._base_metadata(source="explicit_mem0_update", confidence=0.95)
+                metadata.update(relation)
+                metadata["content_fingerprint"] = _fingerprint(content)
+                metadata["updated_memory_id"] = memory_id
+                m.update(memory_id, content, metadata=metadata)
+                return json.dumps({
+                    "result": f"Факт {memory_id} успешно обновлён.",
+                    "write_guard": {
+                        "conflict_status": relation["conflict_status"],
+                        "conflicts_with": relation["conflicts_with"],
+                        "possible_duplicate_of": relation["possible_duplicate_of"],
+                    },
+                }, ensure_ascii=False)
             except Exception as e:
                 return tool_error(f"Не удалось обновить факт: {e}")
 
