@@ -78,6 +78,56 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _extract_subject_keys(text: str) -> set[str]:
+    t = (text or "").lower()
+    entities = [
+        "omniroute", "qdrant", "plex", "torrserver", "transmission", "rclone", 
+        "yandex", "backup", "cookie", "vps", "dreame", "obsidian", "sasha", 
+        "nadya", "nestor", "andrey", "stt", "tts", "whisper", "slack", 
+        "telegram", "ha", "home assistant", "фото", "видео", "мантра", 
+        "песня", "санскрит", "порт", "таймаут", "логи"
+    ]
+    found = {ent for ent in entities if ent in t}
+    # Match structural variables like 'name = value' or 'name: value'
+    match = re.search(r"^\s*([a-zа-я0-9_\-\s]{3,30})\s*[:=]", t)
+    if match:
+        var_name = match.group(1).strip()
+        # Only add if it's a solid word combination
+        if len(var_name.split()) <= 3:
+            found.add(var_name)
+    return found
+
+
+def _calculate_temporal_decay(created_at_str: str, source: str) -> float:
+    try:
+        if not created_at_str:
+            return 1.0
+        # Parse ISO client time or created_at
+        dt_str = created_at_str.replace("Z", "+00:00")
+        # Handle formats like 2026-06-06T18:00:58
+        if "T" in dt_str and "+" not in dt_str and "-" not in dt_str[10:]:
+            dt_str += "+00:00"
+        created_at = datetime.fromisoformat(dt_str)
+        now = datetime.now(timezone.utc)
+        days = (now - created_at).days
+        if days < 0:
+            days = 0
+            
+        # Select lambda based on source
+        # user explicit never decays
+        if "explicit" in (source or "") or (source or "") in ("user", "user_explicit"):
+            decay_rate = 0.0
+        elif (source or "") in ("tool", "tool_log"):
+            decay_rate = 0.05  # fast decay: half-life ~14 days
+        else:
+            decay_rate = 0.005 # default gentle decay (half-life ~138 days)
+            
+        import math
+        return math.exp(-decay_rate * days)
+    except Exception:
+        return 1.0
+
+
 def _fingerprint(text: str) -> str:
     return hashlib.sha256((text or "").strip().lower().encode("utf-8")).hexdigest()[:16]
 
@@ -277,12 +327,28 @@ class Mem0OSSProvider(MemoryProvider):
         possible_duplicates = []
         possible_conflicts = []
         new_guarded = _has_negation_or_toggle(content)
+        keys_content = _extract_subject_keys(content)
+        
         for c in candidates:
             cid = c.get("id") or c.get("memory_id") or ""
             if not cid:
                 continue
             score = float(c.get("score") or 0.0)
             text = _memory_text(c)
+            
+            # Key/subject intersection safety check
+            keys_cand = _extract_subject_keys(text)
+            common_entities = keys_content.intersection(keys_cand)
+            if common_entities:
+                diff_content = keys_content - keys_cand
+                diff_cand = keys_cand - keys_content
+                specifiers = {"порт", "port", "timeout", "таймаут", "логи", "log", "backup", "бэкап", "почта", "email", "url", "путь", "path", "token", "токен"}
+                has_diff_spec = bool(diff_content.intersection(specifiers) and diff_cand.intersection(specifiers))
+                if has_diff_spec:
+                    # They speak about different keys of the same entity (e.g. port vs timeout). Bypass classification.
+                    logger.debug("Bypass: candidate has mismatching specifier keys compared to request")
+                    continue
+
             if score >= 0.72:
                 related.append(cid)
             if score >= 0.92 and not (new_guarded or _has_negation_or_toggle(text)):
@@ -434,22 +500,56 @@ class Mem0OSSProvider(MemoryProvider):
             try:
                 # Clip search query to prevent embedding token limit errors (e.g. 512 tokens for NVIDIA NIM)
                 clipped = query[:800]
-                res = m.search(query=clipped, filters=self._get_active_filters(), limit=top_k)
+                # Query a wider pool of candidates to allow decay re-ranking
+                search_limit = min(top_k * 3, 50)
+                res = m.search(query=clipped, filters=self._get_active_filters(), limit=search_limit)
                 items = res.get("results", []) if isinstance(res, dict) else res
                 if not items:
                     return json.dumps({"result": "Релевантных фактов не найдено."}, ensure_ascii=False)
-                out = []
+                
+                # Perform hybrid scoring (re-ranking)
+                scored_items = []
                 for r in items:
                     mem = r.get("memory", "")
                     if not mem:
                         continue
-                    created_at = r.get("created_at") or ""
+                    
+                    metadata = r.get("metadata", {}) or {}
+                    created_at = r.get("created_at") or metadata.get("created_at") or metadata.get("created_at_client") or ""
+                    source = metadata.get("source") or metadata.get("provenance") or "agent_decision"
+                    confidence = float(metadata.get("confidence") or metadata.get("source_confidence") or 0.85)
+                    
+                    decay_factor = _calculate_temporal_decay(created_at, source)
+                    sim_score = float(r.get("score", 0.0))
+                    
+                    # Hybrid formula: 70% similarity, 30% decay and confidence
+                    final_score = 0.7 * sim_score + 0.3 * decay_factor * confidence
+                    
+                    scored_items.append({
+                        "id": r.get("id") or "",
+                        "memory": mem,
+                        "created_at": created_at,
+                        "raw_score": sim_score,
+                        "score": final_score,
+                        "decay_factor": decay_factor,
+                        "confidence": confidence
+                    })
+                
+                # Sort descending by updated final score
+                scored_items.sort(key=lambda x: x["score"], reverse=True)
+                
+                # Slice down to requested top_k
+                final_results = scored_items[:top_k]
+                
+                out = []
+                for r in final_results:
+                    created_at = r["created_at"]
                     date_prefix = f"[{created_at[:10]}] " if created_at and len(created_at) >= 10 else ""
-                    mem_id = r.get("id") or ""
                     out.append({
-                        "id": mem_id,
-                        "memory": f"{date_prefix}{mem}",
-                        "score": r.get("score", 0),
+                        "id": r["id"],
+                        "memory": f"{date_prefix}{r['memory']}",
+                        "score": r["score"],
+                        "raw_score": r["raw_score"],
                         "created_at": created_at
                     })
                 return json.dumps({"results": out, "count": len(out)}, ensure_ascii=False)

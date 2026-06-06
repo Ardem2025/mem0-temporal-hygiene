@@ -43,6 +43,26 @@ def has_negation_or_toggle(text: str) -> bool:
     return bool(NEGATION_RE.search(text or "") or TOGGLE_RE.search(text or ""))
 
 
+def _extract_subject_keys(text: str) -> set[str]:
+    t = (text or "").lower()
+    entities = [
+        "omniroute", "qdrant", "plex", "torrserver", "transmission", "rclone", 
+        "yandex", "backup", "cookie", "vps", "dreame", "obsidian", "sasha", 
+        "nadya", "nestor", "andrey", "stt", "tts", "whisper", "slack", 
+        "telegram", "ha", "home assistant", "фото", "видео", "мантра", 
+        "песня", "санскрит", "порт", "таймаут", "логи"
+    ]
+    found = {ent for ent in entities if ent in t}
+    # Match structural variables like 'name = value' or 'name: value'
+    match = re.search(r"^\s*([a-zа-я0-9_\-\s]{3,30})\s*[:=]", t)
+    if match:
+        var_name = match.group(1).strip()
+        # Only add if it's a solid word combination
+        if len(var_name.split()) <= 3:
+            found.add(var_name)
+    return found
+
+
 def point_text(point: dict) -> str:
     payload = point.get("payload", {})
     return payload.get("data") or payload.get("memory") or ""
@@ -180,6 +200,7 @@ def group_points_by_similarity(points: list, threshold: float = 0.82) -> list:
             
         current_group = [p_i]
         visited.add(p_i["id"])
+        keys_i = _extract_subject_keys(point_text(p_i))
         
         for j in range(i + 1, len(points)):
             p_j = points[j]
@@ -190,6 +211,17 @@ def group_points_by_similarity(points: list, threshold: float = 0.82) -> list:
             if not vector_j:
                 continue
                 
+            # Key/subject intersection check before similarity check
+            keys_j = _extract_subject_keys(point_text(p_j))
+            common = keys_i.intersection(keys_j)
+            if common:
+                diff_i = keys_i - keys_j
+                diff_j = keys_j - keys_i
+                specifiers = {"порт", "port", "timeout", "таймаут", "логи", "log", "backup", "бэкап", "почта", "email", "url", "путь", "path", "token", "токен"}
+                if bool(diff_i.intersection(specifiers) and diff_j.intersection(specifiers)):
+                    # Key mismatch config! Skip grouping these together to avoid false consolidation.
+                    continue
+
             sim = cosine_similarity(vector_i, vector_j)
             if sim >= threshold:
                 current_group.append(p_j)
@@ -263,7 +295,7 @@ def check_deterministic_merge(group: list, threshold: float = 0.95) -> dict | No
 
     return None
 
-def analyze_group_with_llm(client: openai.OpenAI, model_name: str, group: list) -> dict:
+def analyze_group_with_llm(client: openai.OpenAI, model_name: str, group: list) -> dict | None:
     memories_str = []
     for p in group:
         p_id = p["id"]
@@ -321,7 +353,8 @@ No extra comments, no markdown code blocks, just raw JSON.
             response_format={"type": "json_object"},
             temperature=0.1
         )
-        content = res.choices[0].message.content.strip()
+        raw_content = res.choices[0].message.content
+        content = raw_content.strip() if raw_content else ""
         if content.startswith("```"):
             lines = content.split("\n")
             if lines[0].startswith("```json") or lines[0].startswith("```"):
@@ -329,7 +362,7 @@ No extra comments, no markdown code blocks, just raw JSON.
         return json.loads(content)
     except Exception as e:
         logger.error("LLM group analysis failed: %s", e)
-        return {"deletions": [], "updates": []}
+        return None
 
 def main(dry_run: bool = False):
     logger.info("Initializing Memory Hygiene Job%s...", " (dry-run/report-only)" if dry_run else "")
@@ -393,14 +426,25 @@ def main(dry_run: bool = False):
                 decision = cache[group_hash]
             else:
                 decision = analyze_group_with_llm(client, model_name, group)
-                if not dry_run:
+                if decision is None:
+                    # Deterministic fallback: "newer wins"
+                    logger.warning("  [LLM FAILED] Applying deterministic fallback ('newer wins') to consolidate cluster.")
+                    sorted_group = sorted(group, key=lambda x: x.get("payload", {}).get("created_at") or "")
+                    newest = sorted_group[-1]
+                    deletions_fallback = [p["id"] for p in sorted_group[:-1]]
+                    decision = {
+                        "deletions": deletions_fallback,
+                        "updates": [],
+                        "decision_source": "deterministic_fallback_newer_wins"
+                    }
+                elif not dry_run:
                     cache[group_hash] = decision
                     save_cache(cache_path, cache)
             
         logger.info(f"  Decision: {json.dumps(decision, ensure_ascii=False)}")
         
-        deletions = decision.get("deletions", [])
-        updates = decision.get("updates", [])
+        deletions = decision.get("deletions", []) if decision else []
+        updates = decision.get("updates", []) if decision else []
         
         # Performance updates via Mem0 SDK to sync vector embedding changes
         for update_item in updates:
